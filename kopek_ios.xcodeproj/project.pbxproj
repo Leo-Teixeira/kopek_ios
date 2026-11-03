@@ -6,6 +6,10 @@
 	objectVersion = 110;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		A5D66920309A1F0000658E96 /* KopekKit in Frameworks */ = {isa = PBXBuildFile; productRef = A5D66922309A1F0000658E96 /* KopekKit */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXContainerItemProxy section */
 		A5D668F4309A1BA500658E96 /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
@@ -52,6 +56,7 @@
 		A5D668E3309A1BA400658E96 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			files = (
+				A5D66920309A1F0000658E96 /* KopekKit in Frameworks */,
 			);
 		};
 		A5D668F0309A1BA500658E96 /* Frameworks */ = {
@@ -113,6 +118,9 @@
 				A5D668E8309A1BA400658E96 /* kopek_ios */,
 			);
 			name = kopek_ios;
+			packageProductDependencies = (
+				A5D66922309A1F0000658E96 /* KopekKit */,
+			);
 			productName = kopek_ios;
 			productReference = A5D668E6309A1BA400658E96 /* kopek_ios.app */;
 			productType = "com.apple.product-type.application";
@@ -166,9 +174,6 @@
 			isa = PBXProject;
 			attributes = {
 				BuildIndependentTargetsInParallel = 1;
-				KnownAssetTags = (
-					kopekkit,
-				);
 				LastSwiftUpdateCheck = 2710;
 				LastUpgradeCheck = 2710;
 				TargetAttributes = {
@@ -194,6 +199,9 @@
 			);
 			mainGroup = A5D668DD309A1BA400658E96;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				A5D66921309A1F0000658E96 /* XCLocalSwiftPackageReference "KopekKit" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = A5D668E7309A1BA400658E96 /* Products */;
 			projectDirPath = "";
@@ -588,6 +596,20 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCLocalSwiftPackageReference section */
+		A5D66921309A1F0000658E96 /* XCLocalSwiftPackageReference "KopekKit" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = KopekKit;
+		};
+/* End XCLocalSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		A5D66922309A1F0000658E96 /* KopekKit */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = KopekKit;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = A5D668DE309A1BA400658E96 /* Project object */;
 	validationLevel = 1;
