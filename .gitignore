@@ -1,0 +1,12 @@
+# Xcode : réglages personnels et fichiers générés
+xcuserdata/
+DerivedData/
+*.xcuserstate
+build/
+
+# Swift Package Manager
+.build/
+.swiftpm/
+
+# macOS
+.DS_Store
