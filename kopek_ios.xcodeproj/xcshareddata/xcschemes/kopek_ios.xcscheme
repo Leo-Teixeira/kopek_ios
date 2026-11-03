@@ -49,6 +49,16 @@
                ReferencedContainer = "container:kopek_ios.xcodeproj">
             </BuildableReference>
          </TestableReference>
+         <TestableReference
+            skipped = "NO">
+            <BuildableReference
+               BuildableIdentifier = "primary"
+               BlueprintIdentifier = "KopekKitTests"
+               BuildableName = "KopekKitTests"
+               BlueprintName = "KopekKitTests"
+               ReferencedContainer = "container:KopekKit">
+            </BuildableReference>
+         </TestableReference>
       </Testables>
    </TestAction>
    <LaunchAction
