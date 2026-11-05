@@ -1,515 +1,477 @@
-import Foundation
+// Moteur de répartition mensuelle, porté de Kopek web (src/lib/engine/allocation.ts).
+// Fonctions pures, sans UIKit ni SwiftUI (ni même Foundation) : testables isolément.
+//
+// Règle des types :
+// - tous les montants sont des entiers en centimes (`Int`, 64 bits sur toutes les plateformes Apple actuelles) ;
+// - seuls les pourcentages (`percent`, `urssafRate`, `surplusSavingsPct`) sont des `Double`.
+//
+// Règle des arrondis (JS -> Swift) :
+// - `Math.round` de JS arrondit les demi-valeurs vers +∞ (2,5 -> 3 ; -2,5 -> -2). Aucune règle de
+//   `FloatingPointRoundingRule` ne fait exactement ça : `.toNearestOrAwayFromZero` (celle de `rounded()` et de
+//   `round()`) donne -3 pour -2,5, et `.toNearestOrEven` donne 2 pour 2,5. On écrit donc `jsRound` à la main.
+// - `Math.floor` / `Math.ceil` de JS -> `rounded(.down)` / `rounded(.up)`, puis `Int(...)`.
 
-enum IncomeType: String {
-    case SALARY
-    case SELFEMPLOYED
-    case THIRDPARTY
-    case OTHER
+/// Type d'un revenu. Les valeurs brutes sont celles de l'API web.
+public enum IncomeType: String, Sendable, CaseIterable {
+    case salary = "SALARY"
+    case selfEmployed = "SELF_EMPLOYED"
+    case thirdParty = "THIRD_PARTY"
+    case other = "OTHER"
 }
 
-enum BucketKind: String, CaseIterable {
-    case FIXED
-    case LIFESTYLE
-    case SAVING
-    case ENVELOPE
-
-    var cutOrder: BucketKind {
-        switch self {
-        case .ENVELOPE: return .ENVELOPE
-        case .SAVING: return .SAVING
-        case .LIFESTYLE: return .LIFESTYLE
-        case .FIXED: return .SAVING
-        }
-    }
+/// Famille d'une catégorie de la règle de répartition. Les valeurs brutes sont celles de l'API web.
+public enum BucketKind: String, Sendable, CaseIterable {
+    case fixed = "FIXED"
+    case lifestyle = "LIFESTYLE"
+    case saving = "SAVING"
+    case envelope = "ENVELOPE"
 }
 
-enum ChargeFrequency: String {
-    case MONTHLY
-    case QUATERLY
-    case ANNUALLY
+/// Fréquence de paiement d'une charge récurrente. Les valeurs brutes sont celles de l'API web.
+public enum ChargeFrequency: String, Sendable, CaseIterable {
+    case monthly = "MONTHLY"
+    case quarterly = "QUARTERLY"
+    case yearly = "YEARLY"
 
+    /// Nombre de paiements par an : un `switch` exhaustif, le compilateur refuse un cas oublié.
     var occurrencesPerYear: Int {
         switch self {
-        case .MONTHLY: return 12
-        case .QUATERLY: return 4
-        case .ANNUALLY: return 1
+        case .monthly: 12
+        case .quarterly: 4
+        case .yearly: 1
         }
     }
 }
 
-struct IncomeSummary: Equatable {
-    let gross: Int
-    let selfEmployed: Int
-    let ursaff: Int
-    let net: Int
+/// Erreur levée par le moteur pour une entrée invalide.
+public enum EngineError: Error, Equatable, Sendable {
+    /// Un pourcentage de catégorie est négatif.
+    case negativePercent(bucketID: String, value: Double)
+    /// Un montant fixe de catégorie est négatif.
+    case negativeFixedAmount(bucketID: String, value: Int)
+    /// `surplusSavingsPct` sort de 0...100.
+    case surplusSavingsPctOutOfRange(Double)
+    /// `urssafRate` est négatif.
+    case negativeUrssafRate(Double)
 }
 
-struct RuleTotal: Equatable {
-    let percents: Double
-    let fixed: Double
-    let fixedPercent: Double?
-    let total: Double?
+/// Ordre dans lequel on rogne pour payer les charges fixes quand le mois est faible.
+private let cutOrder: [BucketKind] = [.lifestyle, .envelope, .saving]
+
+/// Équivalent exact de `Math.round` de JS : demi-valeurs vers +∞.
+private func jsRound(_ value: Double) -> Int {
+    let down = value.rounded(.down)
+    return Int(value - down >= 0.5 ? down + 1 : down)
 }
 
-struct BucketInput: Equatable {
-    let id: String
-    let name: String
-    let kind: BucketKind
-    let percent: Double
-    let fixedAmount: Double?
+/// Arrondi au dixième, comme `Math.round(n * 10) / 10` en JS.
+private func roundToTenth(_ value: Double) -> Double {
+    Double(jsRound(value * 10)) / 10
 }
 
-struct BucketResult: Equatable {
-    var input: BucketInput
-    var base: Int
-    var fromSurplus: Int
-    var adjustment: Int
-    var amount: Int
+// MARK: - Charges
+
+/// Équivalent mensuel d'une charge selon sa fréquence (ex. une assurance payée une fois par an, lissée sur 12 mois).
+///
+/// - Parameters:
+///   - amount: montant d'un paiement, en centimes.
+///   - frequency: fréquence de paiement.
+/// - Returns: le montant mensuel lissé, en centimes, arrondi comme `Math.round` de JS.
+public func monthlyEquivalent(of amount: Int, frequency: ChargeFrequency) -> Int {
+    jsRound(Double(amount * frequency.occurrencesPerYear) / 12)
 }
 
-struct ExpenseComparison: Equatable {
-    let kind: BucketKind
-    let objective: Int
-    let actual: Int
-    let delta: Int
-}
+/// Une charge récurrente (loyer, assurance…), en centimes par paiement.
+public struct RecurringCharge: Equatable, Sendable {
+    public let id: String
+    public let label: String
+    public let amount: Int
+    public let frequency: ChargeFrequency
+    public let active: Bool
 
-struct MonthAllocation: Equatable {
-    let available: Double
-    let reference: Double
-    let base: Double
-    let surplus: Double
-    let fixedCharges: Double
-    let fixedMargin: Double
-    let shortFall: Double
-    let unallocated: Double
-    let buckets: [BucketResult]
-}
-
-func monthlyEquivalent(amount: Int, frequency: ChargeFrequency) -> Double {
-    return round(Double(amount * frequency.occurrencesPerYear) / 12)
-}
-
-struct Charges: Equatable {
-    let id: String
-    let label: String
-    let amount: Int
-    let frequency: ChargeFrequency
-    let active: Bool
-}
-
-struct Expense: Equatable {
-    let userId: String
-    let month: String
-    let label: String
-    let amount: Double
-    let kind: String
-    let category: String
-    let recurringChargeId: String
-}
-
-func expensesFromCharges(charges: [Charges], userId: String, month: String) -> [Expense] {
-    return charges.filter({ charge in charge.active }).map({charge in Expense(
-        userId: userId,
-        month: month,
-        label: charge.label,
-        amount: Double(charge.amount),
-        kind: "FIXED",
-        category: "FIXED",
-        recurringChargeId: charge.id
-    )})
-}
-
-struct Incomes: Equatable {
-    let type: IncomeType
-    let amount: Int
-}
-
-func summarizeIncomes(incomes: [Incomes], ursaffRate: Int) -> IncomeSummary {
-    var gross = 0
-    var selfEmployed = 0
-    for income in incomes {
-        gross += income.amount
-        if (income.type == IncomeType.SELFEMPLOYED) {
-            selfEmployed += income.amount
-        }
-    }
-    let ursaff = round(Double(selfEmployed * ursaffRate) / 100)
-    return IncomeSummary(gross: gross, selfEmployed: selfEmployed, ursaff: Int(ursaff), net: gross - Int(ursaff))
-}
-
-
-func ruleTotal(buckets: [BucketInput], income: Double) -> RuleTotal {
-    func roundValue(number: Double) -> Double {
-        return round(number * 10) / 10
-    }
-    let percents = roundValue(number: buckets.filter({ bucket in bucket.fixedAmount == nil }).reduce(0.0, { $0 + $1.percent}))
-    let fixed = buckets.reduce(0.0, {$0 + ($1.fixedAmount ?? 0)})
-    let fixedPercents = fixed == 0 ? 0 : income > 0 ? roundValue(number: (fixed * 100) / income) : nil
-    return RuleTotal(
-        percents: percents,
-        fixed: fixed,
-        fixedPercent: fixedPercents,
-        total: percents + fixed
-    )
-}
-
-func effectiveShares(buckets: [BucketInput], income: Double) -> [String: Double] {
-    let fixedTotal = buckets.reduce(0.0, {$0 + ($1.fixedAmount ?? 0)})
-    let weights = buckets.reduce(0.0, {$0 + ($1 == nil ? $1.percent : 0) })
-    let fixedShare = income > 0 ? min((fixedTotal * 100) / income, 100) : 0.0
-    return buckets.reduce(into: [String: Double]()) { result, bucket in
-
-        let amount: Double
-
-        if let fixedAmount = bucket.fixedAmount {
-            amount = fixedTotal > 0
-                ? (fixedShare * fixedAmount) / fixedTotal
-                : 0
-
-        } else {
-            amount = weights > 0
-                ? ((100 - fixedShare) * bucket.percent) / weights
-                : 0
-        }
-
-        result[bucket.id] = amount
+    // Un struct public n'a qu'un init memberwise `internal` : sans cet init, l'appli ne pourrait pas en créer.
+    public init(id: String, label: String, amount: Int, frequency: ChargeFrequency, active: Bool) {
+        self.id = id
+        self.label = label
+        self.amount = amount
+        self.frequency = frequency
+        self.active = active
     }
 }
 
-func minIncomeForFixedCharges(fixedCharges: Double, fixedPct: Double) -> Int {
-    return Int(fixedPct > 0 ? ceil((fixedCharges * 100) / fixedPct) : 0.0)
+/// Une dépense de charge fixe générée pour un mois.
+public struct ChargeExpense: Equatable, Sendable {
+    public let userID: String
+    public let month: String
+    public let label: String
+    public let amount: Int
+    public let kind: BucketKind
+    public let category: String
+    public let recurringChargeID: String
 }
 
-func referenceIncome(pastNets: [Int]) -> Int {
-    let months = pastNets.filter({ month in month > 0})
-    if (months.count == 0){
-        return 0
-    }
-    return Int(round(months.reduce(0.0, { Double((Int($0) + $1) / months.count) })))
-}
-
-struct Expenses: Equatable {
-    let kind: BucketKind
-    let amount: Int
-}
-
-func summarizeExpenses(
-    expenses: [Expense],
-    buckets: [BucketResult]
-) -> [ExpenseComparison] {
-
-    let kinds = BucketKind.allCases
-
-    return kinds
-        .map { kind in
-
-            let objective = buckets
-                .filter { $0.input.kind == kind }
-                .reduce(0) { $0 + $1.amount }
-
-            let actual = expenses
-                .filter { $0.kind == kind.rawValue }
-                .reduce(0.0) { $0 + $1.amount }
-
-            return ExpenseComparison(
-                kind: kind,
-                objective: objective,
-                actual: Int(actual),
-                delta: objective - Int(actual)
+/// Dépenses à créer pour un mois à partir des charges actives : une ligne par charge, à son équivalent mensuel.
+///
+/// - Parameters:
+///   - charges: les charges récurrentes de l'utilisateur.
+///   - userId: identifiant de l'utilisateur.
+///   - month: mois au format « AAAA-MM ».
+public func expensesFromCharges(_ charges: [RecurringCharge], userId: String, month: String) -> [ChargeExpense] {
+    charges
+        .filter(\.active)
+        .map { charge in
+            ChargeExpense(
+                userID: userId,
+                month: month,
+                label: charge.label,
+                amount: monthlyEquivalent(of: charge.amount, frequency: charge.frequency),
+                kind: .fixed,
+                category: "Charges fixes",
+                recurringChargeID: charge.id
             )
         }
-        .filter { $0.objective > 0 || $0.actual > 0 }
 }
 
-private func spread(total: Double, weights: [Double]) -> [Double] {
-    if (total <= 0 || weights.count == 0) {
-        return weights.map({_ in 0})
+// MARK: - Revenus
+
+/// Un revenu du mois, en centimes.
+public struct Income: Equatable, Sendable {
+    public let type: IncomeType
+    public let amount: Int
+
+    public init(type: IncomeType, amount: Int) {
+        self.type = type
+        self.amount = amount
     }
-    let sum = weights.reduce(0.0, {$0 + $1})
-    if (sum <= 0) {
-        return weights.map({_ in 0})
+}
+
+/// Synthèse des revenus d'un mois, en centimes.
+public struct IncomeSummary: Equatable, Sendable {
+    /// Tous les revenus du mois, argent d'un tiers compris.
+    public let gross: Int
+    /// Chiffre d'affaires de micro-entreprise.
+    public let selfEmployed: Int
+    /// Provision de cotisations URSSAF.
+    public let urssaf: Int
+    /// Ce qui est réellement à répartir : `gross - urssaf`.
+    public let net: Int
+}
+
+/// Additionne les revenus du mois et provisionne l'URSSAF sur le chiffre d'affaires de micro-entreprise.
+///
+/// - Parameters:
+///   - incomes: les revenus du mois.
+///   - urssafRate: taux de cotisation en % (ex. 25.6).
+/// - Throws: `EngineError.negativeUrssafRate` si le taux est négatif.
+public func summarizeIncomes(_ incomes: [Income], urssafRate: Double) throws(EngineError) -> IncomeSummary {
+    guard urssafRate >= 0 else { throw EngineError.negativeUrssafRate(urssafRate) }
+    let gross = incomes.reduce(0) { $0 + $1.amount }
+    let selfEmployed = incomes.filter { $0.type == .selfEmployed }.reduce(0) { $0 + $1.amount }
+    let urssaf = jsRound(Double(selfEmployed) * urssafRate / 100)
+    return IncomeSummary(gross: gross, selfEmployed: selfEmployed, urssaf: urssaf, net: gross - urssaf)
+}
+
+/// Revenu de référence : moyenne des mois précédents qui ont au moins un revenu, arrondie comme `Math.round` de JS.
+///
+/// - Parameter pastNets: revenus nets des mois précédents, en centimes.
+/// - Returns: la moyenne arrondie, ou 0 si aucun mois n'a de revenu.
+public func referenceIncome(pastNets: [Int]) -> Int {
+    let months = pastNets.filter { $0 > 0 }
+    guard !months.isEmpty else { return 0 }
+    // Division en Double : une division entière tronquerait (1,5 -> 1 au lieu de 2).
+    return jsRound(Double(months.reduce(0, +)) / Double(months.count))
+}
+
+/// Revenu minimum pour que les charges fixes restent sous `fixedPct` % du revenu.
+///
+/// - Parameters:
+///   - fixedCharges: charges fixes mensuelles, en centimes.
+///   - fixedPct: part maximale des charges fixes, en %.
+/// - Returns: le revenu minimum en centimes, arrondi au centime supérieur ; 0 si `fixedPct` vaut 0 ou moins.
+public func minIncomeForFixedCharges(_ fixedCharges: Int, fixedPct: Double) -> Int {
+    guard fixedPct > 0 else { return 0 }
+    return Int((Double(fixedCharges) * 100 / fixedPct).rounded(.up))
+}
+
+// MARK: - Règle de répartition
+
+/// Une catégorie de la règle de répartition.
+public struct BucketInput: Equatable, Sendable {
+    public let id: String
+    public let name: String
+    public let kind: BucketKind
+    /// Part en % du revenu ; ignorée si `fixedAmount` est renseigné.
+    public let percent: Double
+    /// Montant fixe mensuel en centimes, ou `nil` pour une catégorie en pourcentage.
+    public let fixedAmount: Int?
+
+    public init(id: String, name: String, kind: BucketKind, percent: Double, fixedAmount: Int? = nil) {
+        self.id = id
+        self.name = name
+        self.kind = kind
+        self.percent = percent
+        self.fixedAmount = fixedAmount
     }
-    var shares = weights.map({ weight in floor(total * weight) / sum})
-    var rest = total - shares.reduce(0.0, { $0 + $1 })
-    var idx = 0
-    while (rest > 0) {
-        shares[idx] += 1.0
-        rest -= 1.0
-        idx = (idx + 1) % shares.count
+}
+
+/// Ce que répartit une règle, en % d'un mois de revenu (voir `ruleTotal(of:income:)`).
+public struct RuleTotal: Equatable, Sendable {
+    /// Somme des pourcentages, arrondie au dixième.
+    public let percents: Double
+    /// Somme des montants fixes, en centimes.
+    public let fixed: Int
+    /// Montants fixes rapportés au revenu, en %, ou `nil` s'il y en a mais que le revenu est inconnu.
+    public let fixedPercent: Double?
+    /// `percents + fixedPercent`, ou `nil` quand `fixedPercent` l'est. Doit valoir 100.
+    public let total: Double?
+
+    public init(percents: Double, fixed: Int, fixedPercent: Double?, total: Double?) {
+        self.percents = percents
+        self.fixed = fixed
+        self.fixedPercent = fixedPercent
+        self.total = total
+    }
+}
+
+/// Ce que la règle répartit, en % d'un mois de revenu (en pratique le revenu moyen) : les pourcentages plus les
+/// montants fixes rapportés à ce revenu (150 € sur 750 € = 20 %). Sans revenu connu, les montants fixes ne se
+/// convertissent pas : `total` est `nil` s'il y en a.
+///
+/// - Parameters:
+///   - buckets: les catégories de la règle.
+///   - income: revenu de référence, en centimes.
+public func ruleTotal(of buckets: [BucketInput], income: Int) -> RuleTotal {
+    let percents = roundToTenth(buckets.filter { $0.fixedAmount == nil }.reduce(0.0) { $0 + $1.percent })
+    let fixed = buckets.reduce(0) { $0 + ($1.fixedAmount ?? 0) }
+    let fixedPercent: Double?
+    if fixed == 0 {
+        fixedPercent = 0
+    } else if income > 0 {
+        fixedPercent = roundToTenth(Double(fixed) * 100 / Double(income))
+    } else {
+        fixedPercent = nil
+    }
+    let total = fixedPercent.map { roundToTenth(percents + $0) }
+    return RuleTotal(percents: percents, fixed: fixed, fixedPercent: fixedPercent, total: total)
+}
+
+/// Part réelle d'une catégorie, en %.
+public struct BucketShare: Equatable, Sendable {
+    public let id: String
+    public let share: Double
+}
+
+/// Part réelle de chaque catégorie dans un mois de revenu `income`, en % (même calcul que `allocateMonth` hors
+/// surplus et charges fixes) : les montants fixes d'abord, puis le reste partagé au prorata des pourcentages. Sans
+/// revenu connu, les montants fixes comptent pour 0 et les pourcentages se partagent 100 %.
+///
+/// - Returns: une part par catégorie, dans l'ordre des catégories (un tableau, car un dictionnaire n'a pas d'ordre).
+public func effectiveShares(of buckets: [BucketInput], income: Int) -> [BucketShare] {
+    let fixedTotal = buckets.reduce(0) { $0 + ($1.fixedAmount ?? 0) }
+    let weights = buckets.filter { $0.fixedAmount == nil }.reduce(0.0) { $0 + $1.percent }
+    let fixedShare = income > 0 ? min(Double(fixedTotal) * 100 / Double(income), 100) : 0
+    return buckets.map { bucket in
+        let share: Double
+        if let fixedAmount = bucket.fixedAmount {
+            share = fixedTotal > 0 ? fixedShare * Double(fixedAmount) / Double(fixedTotal) : 0
+        } else {
+            share = weights > 0 ? (100 - fixedShare) * bucket.percent / weights : 0
+        }
+        return BucketShare(id: bucket.id, share: share)
+    }
+}
+
+// MARK: - Répartition du mois
+
+/// Résultat d'une catégorie après répartition, en centimes.
+public struct BucketResult: Equatable, Sendable {
+    public let input: BucketInput
+    /// Part issue du revenu « normal ».
+    public internal(set) var base: Int
+    /// Bonus d'un mois plus fort que la référence.
+    public internal(set) var fromSurplus: Int
+    /// +/- pour couvrir les charges fixes.
+    public internal(set) var adjustment: Int
+    /// Montant final conseillé.
+    public internal(set) var amount: Int
+}
+
+/// Résultat de `allocateMonth`, en centimes.
+public struct MonthAllocation: Equatable, Sendable {
+    public let available: Int
+    public let reference: Int
+    public let base: Int
+    public let surplus: Int
+    public let fixedCharges: Int
+    /// Reste dans les catégories FIXED après les charges fixes (courses, essence…).
+    public let fixedMargin: Int
+    /// Manque à prendre sur le matelas de sécurité.
+    public let shortfall: Int
+    /// Ce qui reste sans catégorie en pourcentage pour le recevoir (aucune, ou toutes à 0 %).
+    public let unallocated: Int
+    public let buckets: [BucketResult]
+}
+
+/// Répartit `total` proportionnellement aux poids, en centimes entiers, sans perte d'arrondi : chaque part est
+/// arrondie vers le bas, puis les centimes restants sont distribués un par un depuis le début.
+private func spread(_ total: Int, weights: [Double]) -> [Int] {
+    guard total > 0, !weights.isEmpty else { return weights.map { _ in 0 } }
+    let sum = weights.reduce(0, +)
+    guard sum > 0 else { return weights.map { _ in 0 } }
+    var shares = weights.map { Int((Double(total) * $0 / sum).rounded(.down)) }
+    var rest = total - shares.reduce(0, +)
+    var index = 0
+    while rest > 0 {
+        shares[index] += 1
+        rest -= 1
+        index = (index + 1) % shares.count
     }
     return shares
 }
 
-struct AllocateMonthInput {
-    let net: Double
-    let reference: Double
-    let fixedCharges: Double
-    let buckets: [BucketInput]
-    let surplusSavingsPct: Double
-}
-
-private func createBucketResults(
-    _ buckets: [BucketInput]
-) -> [BucketResult] {
-
-    return buckets.map { bucket in
-        BucketResult(
-            input: bucket,
-            base: 0,
-            fromSurplus: 0,
-            adjustment: 0,
-            amount: 0
-        )
-    }
-}
-
-private func allocateBase(
-    results: [BucketResult],
-    base: Double
-) -> [BucketResult] {
-
-    var results = results
-
-    let fixedIndices = results.indices.filter {
-        results[$0].input.fixedAmount != nil
+/// Répartit le revenu net d'un mois entre les catégories de la règle.
+///
+/// 1. Mois fort (`net > reference`) : la référence est répartie selon la règle, le surplus à part
+///    (`surplusSavingsPct` % vers l'épargne et les enveloppes en pourcentage, le reste au prorata).
+/// 2. Les montants fixes sont prélevés d'abord, les pourcentages se partagent le reste.
+/// 3. Mois faible : les charges fixes sont incompressibles, on rogne plaisir, puis enveloppes, puis épargne.
+///
+/// - Parameters:
+///   - net: revenu net du mois, en centimes (un négatif compte pour 0).
+///   - reference: revenu de référence (voir `referenceIncome(pastNets:)`), en centimes ; 0 si inconnu.
+///   - fixedCharges: charges fixes du mois, en centimes.
+///   - buckets: les catégories de la règle.
+///   - surplusSavingsPct: part du surplus envoyée à l'épargne, en % (0 à 100).
+/// - Throws: `EngineError` si un pourcentage ou un montant fixe est négatif, ou si `surplusSavingsPct` sort de 0...100.
+public func allocateMonth(
+    net: Int,
+    reference: Int,
+    fixedCharges: Int,
+    buckets: [BucketInput],
+    surplusSavingsPct: Double
+) throws(EngineError) -> MonthAllocation {
+    guard (0...100).contains(surplusSavingsPct) else { throw EngineError.surplusSavingsPctOutOfRange(surplusSavingsPct) }
+    for bucket in buckets {
+        guard bucket.percent >= 0 else { throw EngineError.negativePercent(bucketID: bucket.id, value: bucket.percent) }
+        if let fixedAmount = bucket.fixedAmount, fixedAmount < 0 {
+            throw EngineError.negativeFixedAmount(bucketID: bucket.id, value: fixedAmount)
+        }
     }
 
-    let flexibleIndices = results.indices.filter {
-        results[$0].input.fixedAmount == nil
-    }
+    let available = max(net, 0)
 
-    let totalFixedAmount = fixedIndices.reduce(0.0) {
-        $0 + (results[$1].input.fixedAmount ?? 0)
-    }
+    // 1. Mois fort : on répartit la référence selon la règle, le surplus est traité à part.
+    let base = reference > 0 && available > reference ? reference : available
+    let surplus = available - base
+
+    // État modifiable LOCAL : un tableau de structs (types valeur), modifié sur place, jamais partagé.
+    var res = buckets.map { BucketResult(input: $0, base: 0, fromSurplus: 0, adjustment: 0, amount: 0) }
+
+    let fixedIndices = res.indices.filter { res[$0].input.fixedAmount != nil }
+    let flexibleIndices = res.indices.filter { res[$0].input.fixedAmount == nil }
+    let totalFixedAmount = fixedIndices.reduce(0) { $0 + (res[$1].input.fixedAmount ?? 0) }
 
     if totalFixedAmount > base {
-
-        let shares = spread(
-            total: base,
-            weights: fixedIndices.map {
-                results[$0].input.fixedAmount ?? 0
-            }
-        )
-
-        for (idx, index) in fixedIndices.enumerated() {
-            results[index].base = Int(shares[idx])
-        }
-
-        for index in flexibleIndices {
-            results[index].base = 0
-        }
-
+        // Les montants fixes à eux seuls dépassent l'argent disponible : on les réduit proportionnellement.
+        let shares = spread(base, weights: fixedIndices.map { Double(res[$0].input.fixedAmount ?? 0) })
+        for (i, index) in fixedIndices.enumerated() { res[index].base = shares[i] }
     } else {
+        for index in fixedIndices { res[index].base = res[index].input.fixedAmount ?? 0 }
+        let shares = spread(base - totalFixedAmount, weights: flexibleIndices.map { res[$0].input.percent })
+        for (i, index) in flexibleIndices.enumerated() { res[index].base = shares[i] }
+    }
 
-        for index in fixedIndices {
-            results[index].base = Int(
-                results[index].input.fixedAmount ?? 0
-            )
+    if surplus > 0 {
+        // Un montant fixe ne grossit pas les mois forts : seules les catégories en pourcentage profitent du surplus.
+        let saverIndices = flexibleIndices.filter {
+            let bucket = res[$0].input
+            return (bucket.kind == .saving || bucket.kind == .envelope) && bucket.percent > 0
         }
-
-        let shares = spread(
-            total: base - totalFixedAmount,
-            weights: flexibleIndices.map {
-                results[$0].input.percent
-            }
-        )
-
-        for (idx, index) in flexibleIndices.enumerated() {
-            results[index].base = Int(shares[idx])
-        }
+        let toSavers = saverIndices.isEmpty ? 0 : jsRound(Double(surplus) * surplusSavingsPct / 100)
+        let saverShares = spread(toSavers, weights: saverIndices.map { res[$0].input.percent })
+        for (i, index) in saverIndices.enumerated() { res[index].fromSurplus += saverShares[i] }
+        let otherShares = spread(surplus - toSavers, weights: flexibleIndices.map { res[$0].input.percent })
+        for (i, index) in flexibleIndices.enumerated() { res[index].fromSurplus += otherShares[i] }
     }
+    for index in res.indices { res[index].amount = res[index].base + res[index].fromSurplus }
 
-    return results
-}
+    // 2. Mois faible : les charges fixes sont incompressibles, on rogne plaisir -> enveloppes -> épargne.
+    // Sans catégorie FIXED, on ne devine pas où rogner : les charges fixes deviennent un manque direct.
+    let fixedKindIndices = res.indices.filter { res[$0].input.kind == .fixed }
+    let fixedBudget = fixedKindIndices.reduce(0) { $0 + res[$1].amount }
+    var gap = fixedKindIndices.isEmpty ? fixedCharges : fixedCharges - fixedBudget
+    var covered = 0
 
-private func allocateSurplus(
-    results: [BucketResult],
-    surplus: Double,
-    surplusSavingsPct: Double
-) -> [BucketResult] {
-
-    var results = results
-
-    guard surplus > 0 else { return results }
-
-    let flexibleIndices = results.indices.filter {
-        results[$0].input.fixedAmount == nil
-    }
-
-    let savers = flexibleIndices.filter {
-        (results[$0].input.kind == .SAVING ||
-         results[$0].input.kind == .ENVELOPE)
-        && results[$0].input.percent > 0
-    }
-
-    let toSavers = !savers.isEmpty
-        ? (surplus * surplusSavingsPct / 100).rounded()
-        : 0
-
-    let saverShares = spread(
-        total: toSavers,
-        weights: savers.map {
-            results[$0].input.percent
-        }
-    )
-
-    for (idx, index) in savers.enumerated() {
-        results[index].fromSurplus += Int(saverShares[idx])
-    }
-
-    let remainingSurplus = surplus - toSavers
-
-    let flexibleShares = spread(
-        total: remainingSurplus,
-        weights: flexibleIndices.map {
-            results[$0].input.percent
-        }
-    )
-
-    for (idx, index) in flexibleIndices.enumerated() {
-        results[index].fromSurplus += Int(flexibleShares[idx])
-    }
-
-    return results
-}
-
-private func coverFixedCharges(
-    results: [BucketResult],
-    fixedCharges: Double,
-    cutOrder: [BucketKind]
-) -> (shortfall: Double, fixedMargin: Double) {
-
-    var results = results
-
-    let fixed = results.indices.filter {
-        results[$0].input.kind == .FIXED
-    }
-
-    let fixedBudget = fixed.reduce(0.0) {
-        $0 + Double(results[$1].amount)
-    }
-
-    var gap = !fixed.isEmpty
-        ? fixedCharges - fixedBudget
-        : fixedCharges
-
-    var covered = 0.0
-
-    if gap > 0 && !fixed.isEmpty {
-
+    if gap > 0 && !fixedKindIndices.isEmpty {
         for kind in cutOrder {
-
-            if gap <= 0 {
-                break
-            }
-
-            let group = results.indices.filter {
-                results[$0].input.kind == kind
-                && results[$0].amount > 0
-            }
-
-            let pool = group.reduce(0.0) {
-                $0 + Double(results[$1].amount)
-            }
-
+            if gap <= 0 { break }
+            let group = res.indices.filter { res[$0].input.kind == kind && res[$0].amount > 0 }
+            let pool = group.reduce(0) { $0 + res[$1].amount }
             let take = min(pool, gap)
-
-            let shares = spread(
-                total: take,
-                weights: group.map {
-                    Double(results[$0].amount)
-                }
-            )
-
-            for (idx, index) in group.enumerated() {
-                results[index].adjustment -= Int(shares[idx])
-                results[index].amount -= Int(shares[idx])
+            let shares = spread(take, weights: group.map { Double(res[$0].amount) })
+            for (i, index) in group.enumerated() {
+                res[index].adjustment -= shares[i]
+                res[index].amount -= shares[i]
             }
-
             gap -= take
             covered += take
         }
-
-        let fixedShares = spread(
-            total: covered,
-            weights: fixed.map {
-                results[$0].input.percent != 0
-                    ? results[$0].input.percent
-                    : 1
-            }
-        )
-
-        for (idx, index) in fixed.enumerated() {
-            results[index].adjustment += Int(fixedShares[idx])
-            results[index].amount += Int(fixedShares[idx])
+        // `b.percent || 1` en JS : un poids de 1 pour une catégorie FIXED à 0 %.
+        let fixedWeights = fixedKindIndices.map { res[$0].input.percent != 0 ? res[$0].input.percent : 1 }
+        let shares = spread(covered, weights: fixedWeights)
+        for (i, index) in fixedKindIndices.enumerated() {
+            res[index].adjustment += shares[i]
+            res[index].amount += shares[i]
         }
     }
 
-    let shortfall = max(gap, 0)
-
-    let fixedAfter = fixed.reduce(0.0) {
-        $0 + Double(results[$1].amount)
-    }
-
-    let fixedMargin = !fixed.isEmpty
-        ? max(fixedAfter - fixedCharges, 0)
-        : 0
-
-    return (shortfall, fixedMargin)
-}
-
-func allocateMonth(
-    input: AllocateMonthInput,
-    cutOrder: [BucketKind]
-) -> MonthAllocation {
-
-    let available = max(input.net, 0)
-
-    let base = input.reference > 0 && available > input.reference
-        ? input.reference
-        : available
-
-    let surplus = available - base
-
-    var res = createBucketResults(input.buckets)
-
-    // 1. Répartition de la base.
-    allocateBase(results: res, base: base)
-
-    // 2. Répartition du surplus.
-    allocateSurplus(
-        results: res,
-        surplus: surplus,
-        surplusSavingsPct: input.surplusSavingsPct
-    )
-
-    // 3. Calcul des montants avant ajustement.
-    for index in res.indices {
-        res[index].amount = res[index].base + res[index].fromSurplus
-    }
-
-    // 4. Couverture des charges fixes.
-    let coverage = coverFixedCharges(
-        results: res,
-        fixedCharges: input.fixedCharges,
-        cutOrder: cutOrder
-    )
-
-    // 5. Calcul du montant total réparti.
-    let allocated = res.reduce(0.0) {
-        $0 + Double($1.amount)
-    }
+    let fixedAfter = fixedKindIndices.reduce(0) { $0 + res[$1].amount }
+    let allocated = res.reduce(0) { $0 + $1.amount }
 
     return MonthAllocation(
         available: available,
-        reference: input.reference,
+        reference: reference,
         base: base,
         surplus: surplus,
-        fixedCharges: input.fixedCharges,
-        fixedMargin: coverage.fixedMargin,
-        shortFall: coverage.shortfall,
+        fixedCharges: fixedCharges,
+        fixedMargin: fixedKindIndices.isEmpty ? 0 : max(fixedAfter - fixedCharges, 0),
+        shortfall: max(gap, 0),
         unallocated: max(available - allocated, 0),
         buckets: res
     )
+}
+
+// MARK: - Dépenses réelles
+
+/// Une dépense réelle du mois, réduite à ce dont la comparaison a besoin.
+public struct ExpenseInput: Equatable, Sendable {
+    public let kind: BucketKind
+    public let amount: Int
+
+    public init(kind: BucketKind, amount: Int) {
+        self.kind = kind
+        self.amount = amount
+    }
+}
+
+/// Objectif de la règle contre dépenses réelles pour une famille de catégories, en centimes.
+public struct ExpenseComparison: Equatable, Sendable {
+    public let kind: BucketKind
+    public let objective: Int
+    public let actual: Int
+    /// `objective - actual` : positif s'il reste de la marge.
+    public let delta: Int
+}
+
+/// Compare les dépenses réelles du mois aux montants de la règle de répartition, par famille de catégories.
+///
+/// - Returns: une ligne par `BucketKind` qui a un objectif ou des dépenses, dans l'ordre de l'enum.
+public func summarizeExpenses(_ expenses: [ExpenseInput], buckets: [BucketResult]) -> [ExpenseComparison] {
+    BucketKind.allCases
+        .map { kind in
+            let objective = buckets.filter { $0.input.kind == kind }.reduce(0) { $0 + $1.amount }
+            let actual = expenses.filter { $0.kind == kind }.reduce(0) { $0 + $1.amount }
+            return ExpenseComparison(kind: kind, objective: objective, actual: actual, delta: objective - actual)
+        }
+        .filter { $0.objective > 0 || $0.actual > 0 }
 }
